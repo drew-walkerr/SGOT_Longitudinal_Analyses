@@ -1,0 +1,676 @@
+---
+title: "SGLReportwithREDCap"
+author: "Drew Walker"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+```{r setup, include=FALSE}
+library(devtools)
+library(pkgbuild)
+library(rlang)
+library(purrr)
+library(tidyverse)
+library(lubridate)
+library(RColorBrewer)
+library(knitr)
+library(yaml)
+library(rmarkdown)
+library(ggplot2)
+library(here)
+library(patchwork)
+library(gt)
+library(redcapAPI)
+library(scales)
+library(fuzzyjoin)
+library(ggrepel)
+#Read in data from REDCap on discord user ids, names and status
+options(scipen = 100)
+redcap_api_url <- 'https://redcap.ctsi.ufl.edu/redcap/api/' 
+#set options to allow us to access project files
+#below is the token and urls
+options(redcap_api_url)
+
+APIToken <- read_csv("apitoken.csv", col_names = FALSE)
+StreetlightDatabaseToken <- as.character(APIToken[1,1])
+rcon <- redcapConnection(redcap_api_url, token = StreetlightDatabaseToken)
+
+VolToken <- read_csv("volunteertoken.csv", col_names = FALSE)
+StreetlightVolunteerToken <- as.character(VolToken[1,1])
+vcon <- redcapConnection(redcap_api_url, token = StreetlightVolunteerToken)
+```
+
+```{r dataload-players, include=FALSE}
+#Filtering to just the SGL data on patients involved in SGL 
+files <- dir(path = getwd(), pattern = "Players.", full.names = TRUE)
+tbl <- sapply(files, read_csv, simplify = FALSE) %>%
+  bind_rows(.id = "fileid")
+#Then after reading in and uploading, can we move these files to an archive? 
+#format for merging
+cuttbl <- tbl %>%
+  select(-fileid,-xp, -level,-X1) %>% 
+  arrange(desc(date))
+cuttbl$id <- as.character(cuttbl$id)
+```
+
+
+
+
+```{r dataload-from-REDCap, include=FALSE}
+#format for merging 
+#REPLACE WITH REDCAP PULL
+REDCapData_Patients <- exportRecords(rcon,labels = FALSE)
+
+patient_comments <- REDCapData_Patients %>% 
+  filter(redcap_repeat_instrument == "sgl_comments") %>% 
+  select(comments_user,comments_id,comments_message_count,comments_date) %>% 
+  rename(user = comments_user,
+         id = comments_id,
+         message_count = comments_message_count,
+         date = comments_date)
+patient_comments$date <- as.Date(patient_comments$date)
+patient_comments <- patient_comments %>% 
+    arrange(desc(date))
+patient_comments$id <- as.character(patient_comments$id)
+```
+
+```{r volunteer-redcap-data-load, echo = FALSE}
+REDCapData_Volunteers <- exportRecords(vcon,labels = FALSE)
+
+volunteer_comments <- REDCapData_Volunteers %>% 
+  filter(redcap_repeat_instrument == "sgl_comments") %>% 
+  select(comments_user,comments_id,comments_message_count,comments_date) %>% 
+  rename(user = comments_user,
+         id = comments_id,
+         message_count = comments_message_count,
+         date = comments_date)
+volunteer_comments$date <- as.Date(volunteer_comments$date)
+volunteer_comments <- volunteer_comments %>% 
+    arrange(desc(date))
+volunteer_comments$id <- as.character(volunteer_comments$id)
+```
+
+```{r, combine-redcap-volunteers-and-patients, echo = FALSE}
+sglhistory <- bind_rows(patient_comments,volunteer_comments)
+```
+
+
+```{r recent-players-data-and-history-merge, include=FALSE}
+#combine recent files with history
+megatbl <- bind_rows(cuttbl,sglhistory) %>% 
+  distinct() %>% 
+  arrange(desc(date))
+
+# CREATE SGL DATASET With last_message count, recent comments ------------------------------------------------------
+datedtbl <- megatbl %>% 
+  group_by(id) %>% 
+  mutate(last_date = dplyr::lead(date, order_by = id),
+         last_message_count = lead(message_count, order_by = id)) 
+datedtbl$last_message_count <- replace(datedtbl$last_message_count, is.na(datedtbl$last_date),0)
+datedtbl <- datedtbl %>% 
+  mutate(recent_comments = (message_count - last_message_count),
+         time_interval = as.duration(last_date %--% date),
+         daily_comments = recent_comments %/% (time_interval %/% 86400)) %>% 
+  ungroup()
+#Datacleaning step necessary in preserving accurate id values
+datedtbl$id <- as.character(datedtbl$id)
+```
+
+```{r, REDCapDataPull-naming-patients-and-vols-and-roles, include=FALSE}
+SGLPatientsREDCap <- REDCapData_Patients %>% 
+  group_by(record_id) %>% 
+  fill(p_full_name,vol_preferred_name,bday,deceased) %>% 
+    ungroup() %>% 
+  filter(id != "NA",
+         record_id != "NA") %>% 
+  select(record_id,p_full_name, vol_preferred_name, id, discord_user,status,bday,deceased,sgl_study_eligible) %>% 
+  rename(player_name = p_full_name)
+today <- as.Date(Sys.Date())
+intervalbday <- SGLPatientsREDCap$bday %--% today
+
+#Now pull in volunteer information
+
+REDCapData_Volunteers <- exportRecords(vcon,labels = FALSE)
+
+#New SGL Repeated Form version
+SGLVolunteers <- REDCapData_Volunteers %>% 
+  group_by(record_id) %>% 
+  fill(v_full_name) %>% 
+  ungroup() %>% 
+  filter(discordd_id != "NA",record_id != "NA") %>% 
+  select(record_id,v_full_name, discordd_id, discord_userr,status) %>% 
+  rename(player_name = v_full_name,
+         id = discordd_id,
+         discord_user = discord_userr,
+         vol_record_id= record_id) %>% 
+  mutate(record_id = paste("V",vol_record_id))
+SGLVolunteers$id <- as.character(SGLVolunteers$id)
+
+SGLPatientsMerge <- SGLPatientsREDCap %>% 
+  select(id, discord_user, player_name,status,record_id) 
+
+SGLRecruitLogMaster <- bind_rows(SGLPatientsMerge,SGLVolunteers)
+datedtblnames <- full_join(datedtbl,SGLRecruitLogMaster, by = "id") %>% 
+  group_by(id)
+```
+
+```{r, dataset merge, include=FALSE}
+#Merge compiled Discord Information with Gaming League Recruit Log Data
+
+# CREATING DAILY TREND DATAFRAME ------------------------------------------
+day <- first(datedtblnames$date)
+last_day <- day - 1
+last_week_day <- day - 7
+last_month_day <- day -31
+last_year_day <- day - 365
+#recent_pull: A cut of the datedtblnames with the most recent current total comment values
+recent_pull <- datedtblnames %>% 
+  slice(which.max(as.Date(date)))
+recent_pull <- recent_pull %>% 
+  arrange(desc(recent_comments))
+#Fixing SGL IDs/Users
+
+recent_pull_correct_ids <- recent_pull %>% 
+  filter(date == day) %>% 
+  select(user,id)
+#CORRECTING IDs for OLD SGL, RECALCULATING, adding current user to be able to look back 
+datedtbl_correct_ids <- stringdist_inner_join(datedtbl,recent_pull_correct_ids, by = "id", max_dist = 3)
+datedtbl <- datedtbl_correct_ids %>% 
+  select(-id.x) %>% 
+  rename(id = id.y,
+         user = user.x,
+         user_current = user.y) %>% 
+  group_by(id) %>% 
+  mutate(last_date = dplyr::lead(date, order_by = id),
+         last_message_count = lead(message_count, order_by = id)) 
+datedtbl$last_message_count <- replace(datedtbl$last_message_count, is.na(datedtbl$last_date),0)
+datedtbl <- datedtbl %>% 
+  mutate(recent_comments = (message_count - last_message_count),
+         time_interval = as.duration(last_date %--% date),
+         daily_comments = recent_comments %/% (time_interval %/% 86400)) %>% 
+  ungroup()
+#JOIN WITH REDCAP NAMES
+datedtblnames <- full_join(datedtbl,SGLRecruitLogMaster, by = "id") %>% 
+  group_by(id)
+
+#LAST PULL: Let's make a quick dataset with just the active_users_today
+active_users_today <- recent_pull %>% 
+  filter(recent_comments != 0)
+#LAST WEEK: active_users_last_week
+active_users_last_week <- datedtblnames %>% 
+  filter(date > last_week_day) %>% 
+  filter(recent_comments != 0) %>% 
+  mutate(
+    mean_comments = mean(recent_comments),
+    total_comments_week = sum(recent_comments)) %>% 
+  filter(date == as.Date(max(date)))
+#LAST MONTH: active_users_last_month
+active_users_last_month <- datedtblnames %>% 
+  filter(date > last_month_day)%>% 
+  filter(recent_comments > 0) %>% 
+  mutate(
+    mean_comments = mean(recent_comments),
+    total_comments_month = sum(recent_comments)) %>% 
+  filter(date == as.Date(max(date)))
+# SUMMARY TABLES ----------------------------------------------------------
+#daily_summaries is a combination of multiple datapoint summaries, number of active users, etc 
+#total_users_by_date is a summary df (date and the total number of users on Discord. Not active, just that they have it)
+total_users_by_date <- datedtblnames %>% 
+  group_by(date) %>% 
+  summarise(
+    users_in_discord = n()
+  )
+#total_active_users_by_date represents the total active users for each date.
+total_active_users_by_date <- datedtblnames %>% 
+  group_by(date) %>% 
+  filter(recent_comments != 0) %>% 
+  summarise(
+    recent_comments_total = sum(recent_comments, na.rm = TRUE),
+    active_users = n())
+
+daily_summaries <- merge(total_users_by_date,total_active_users_by_date)
+month_daily_summaries <- daily_summaries %>% 
+  filter(date > last_month_day)
+#The issue causing the jump is that there is a disconnect between the correct ID for these patients
+#So, we need to come up with a comprehensive list of all users with their correct ids, then merge that based on their username into datedtbl
+```
+
+
+```{r, firstday-code, echo = FALSE}
+#This code is able to calculate the days since joining discord for every comment pull date. Will be helpful to build into REDCap upload. 
+firstday_set <- datedtblnames %>% 
+  group_by(record_id) %>% 
+  mutate(first_day_in_discord = min(date),
+         days_since_discord_first_comment = date - first_day_in_discord)
+```
+
+
+## SGL Social Engagement
+
+This is a report meant to describe the daily commenting trends and active players in the Streetlight Gaming League.
+```{r plots, echo=FALSE}
+#This is the comment active users since March 23rd
+#uses active users as dataframe
+p_yesterday_comments_user_bar <- ggplot(data = active_users_today, aes(reorder(user, recent_comments), y = recent_comments, fill = user, label = recent_comments))+
+  geom_col(show.legend = FALSE,
+           width = 1)+
+  geom_text(nudge_y = .25)+
+  labs(x = NULL, y = NULL,
+       title = "Yest. Comments by User",
+       subtitle = (paste(last_day,"to",day, sep = " "))) + 
+  coord_flip()+
+    theme_classic()
+
+#Comments per Status Plot from Yesterday's server data
+#Dataframe: active_users_today 
+p_status_yesterday_comments <- ggplot(data = active_users_today, aes(reorder(status, recent_comments), y = recent_comments, fill = status))+
+  geom_col(show.legend = FALSE,
+           width = 1)+
+  labs(x = NULL, y = NULL,
+       title = "Yesterday's Comments by SL Status",
+       subtitle = paste(last_day,"to",day, sep = " "))+
+  coord_flip()+
+    theme_classic()
+
+#let's do it with names
+p_yesterday_comments_name_bar <- ggplot(data = active_users_today, aes(reorder(player_name, recent_comments), y = recent_comments, fill = status, label = recent_comments))+
+  geom_col(show.legend = TRUE,
+           width = 1)+
+  geom_text(nudge_y = .25)+
+  labs(x = NULL, y = NULL,
+       title = "Yest. Comments by Status and Name",
+       subtitle = (paste(last_day,"to",day, sep = " "))) + 
+  coord_flip() +
+    theme_classic()
+
+#Plot for Daily Comments Totals Last Month 
+#Dataframe: monthly_daily_summaries
+p_month_recent_comments_totals <- ggplot(month_daily_summaries, aes(date, recent_comments_total, fill = date, label = recent_comments_total))+
+  geom_col(show.legend = FALSE)+
+  geom_text(nudge_y = 4)+
+  labs(x = NULL, y = NULL)+
+  ggtitle('Total Comments Per Day')+
+  ylim(0,250)+
+  theme_classic()
+
+#Plotting Trends in Active Users
+p_month_active_users <- ggplot(month_daily_summaries, aes(date, active_users, fill = date, label = active_users))+
+  geom_col(show.legend = FALSE)+
+  geom_text(nudge_y = 1)+
+  labs(x = NULL, y = NULL)+
+  ggtitle('SGL Daily Active Users')+
+    theme_classic()
+
+
+p_timeline_active_users <- ggplot(daily_summaries, aes(date, active_users, label = active_users))+
+  geom_point(show.legend = FALSE)+
+  geom_smooth(method = 'lm')+
+  labs(x = NULL, y = NULL)+
+  ggtitle('SGL Daily Active Users Since Jan 24, 2019')+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b-%y")+
+    theme_classic()
+
+
+p_timeline_daily_comments_totals <- ggplot(daily_summaries, aes(date, recent_comments_total))+
+  geom_point()+
+    geom_smooth(method = 'lm')+
+  labs(x = NULL, y = NULL)+
+  ggtitle('Total Comments Per Day since Jan 24, 2019')+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b-%y")+
+    ylim(0,300)+
+    theme_classic()
+
+
+#Plotting Trends in Total Discord Server Members
+p_timeline_discord_server_members <- ggplot(daily_summaries, aes(date, users_in_discord)) +
+  geom_point()+
+    geom_smooth(method = 'lm')+
+  labs(x = NULL, y = NULL, title = "Discord Members since Jan 24, 2019", caption = "Flat line from 2020-02-recently = Mee6 code page limit")+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b-%y")+
+    ylim(0,150)+
+    theme_classic()
+
+
+#Combining graphs for nice visualizations
+p_month_active_users
+p_month_recent_comments_totals
+p_status_yesterday_comments
+p_yesterday_comments_user_bar
+p_yesterday_comments_name_bar
+p_timeline_active_users
+p_timeline_daily_comments_totals
+p_timeline_discord_server_members
+```
+
+##Active Users Since Last Week 
+This graph gives a sum of the comments made by users active in the last week in sgl.  
+```{r usersonlylastweek, echo = FALSE}
+p_active_week <- ggplot(data = active_users_last_week, aes(reorder(user, total_comments_week), y = total_comments_week, fill = user, label = total_comments_week))+
+  geom_col(show.legend = FALSE,
+           width = 1)+
+  geom_text(aes(label = total_comments_week))+
+  labs(x = NULL, y = NULL,
+       title = "Last Week's Comments by User",
+       subtitle = paste("From",last_week_day,"to",day, sep = " ")) +
+  coord_flip()+
+  theme_classic()
+```
+##Active Users Last Week with Names and Status
+This will give us the player's names also
+```{r userslastweekwithnamesandstatus, echo = FALSE}
+p_active_week_names <- ggplot(data = active_users_last_week, aes(reorder(player_name, total_comments_week), y = total_comments_week, fill = status, label = total_comments_week))+
+  geom_col(show.legend = TRUE,
+           width = 1)+
+  geom_text(aes(label = total_comments_week))+
+  labs(x = NULL, y = NULL,
+       title = "Last Week's Comments by Name/Status",
+       subtitle = paste(last_week_day,"to",day, sep = " "))+
+  coord_flip()+
+  theme_classic()
+p_active_week
+p_active_week_names
+```
+
+
+##Active Users Since Last Month
+
+This graph represents the total number of comments of all active players in the last month, by username. 
+
+```{r userslastmonth, echo = FALSE}
+p_active_month <- ggplot(data = active_users_last_month, aes(reorder(user, total_comments_month), y = total_comments_month, fill = user, label = total_comments_month))+
+  geom_col(show.legend = FALSE,
+           width = 1)+
+  geom_text(aes(label = total_comments_month))+
+  labs(x = NULL, y = NULL,
+        title = "Last Month's Comments by User",
+       subtitle = paste(last_month_day,"to",day, sep = " "))+
+  coord_flip()+
+  theme_classic()
+p_active_month
+```
+##Active Patients, Volunteers, and Staff from Last Month
+```{r userslastmonthwithnames, echo = FALSE}
+p_active_month_names <- ggplot(data = active_users_last_month, aes(reorder(player_name, total_comments_month), y = total_comments_month, fill = status, label = total_comments_month))+
+  geom_col(show.legend = TRUE,
+           width = 1)+
+  geom_text(aes(label = total_comments_month))+
+  labs(x = NULL, y = NULL,
+       title = "Last Month's Comments by Name/Status",
+       subtitle = paste(last_month_day,"to",day, sep = " "))+
+  coord_flip()+
+  theme_classic()
+p_active_month_names
+```
+
+
+```{r comment totals, echo=FALSE}
+p_comment_total <- ggplot(data = recent_pull, aes(reorder(player_name, message_count), y = message_count, fill = status, label = message_count))+
+  geom_col(show.legend = FALSE,width = 1)+
+  geom_text(aes(label = message_count))+
+  labs(x = NULL, y = NULL) +
+  ggtitle(paste("Total Comments per User"))+
+  coord_flip()+
+  theme_classic()
+p_comment_total
+```
+##Filesaving Processes
+```{r,merge recruitlog and recent_pull, include=FALSE, echo = FALSE}
+SGLCheatSheet <- semi_join(recent_pull,SGLRecruitLogMaster,by = "id")
+SGLCheatSheet <- SGLCheatSheet %>% 
+  select(id, player_name,user,status,message_count,recent_comments,date)
+```
+
+# The Non-Commenters Lists
+Aims to create dataframe of everyone who has joined Discord, but capturing folks who have not commented also. 
+
+```{r, noncommenters-list, echo = FALSE}
+#Volunteers Commenters and NonCommenters 
+vols_comment_and_non_commmenters <- REDCapData_Volunteers %>% 
+  filter(discord_user != "NA") %>% 
+  select(v_full_name,discord_user,discord_id,status,date_mod_training) %>% 
+  mutate(redcap_project = "Volunteers")
+
+patients_comment_and_non_commenters <- REDCapData_Patients %>% 
+  fill(p_full_name,age) %>% 
+  filter(discord_user != "NA") %>% 
+  select(p_full_name,age,discord_user,id,status,date_recruited) %>% 
+  mutate(minor_status = ifelse(age >= 18, "Adult", 
+                               ifelse(age < 18, "Minor", NA))) %>% 
+  mutate(redcap_project = "Patients")
+#Match Variable Names 
+
+```
+
+
+```{r, slicetotals, echo = FALSE}
+SGLCheatSheetSlice <- SGLCheatSheet %>% 
+  group_by(player_name) %>% 
+  arrange(desc(message_count)) %>% 
+  filter(message_count > 25)
+
+SGLComments <- ggplot(data = SGLCheatSheetSlice, aes(x = status, y = message_count, fill = status)) +
+  geom_bar(stat = "identity", color ="black")
+SGLComments <- SGLComments + labs(title="Streetlight Gaming League Discord Comments by Player Status", x = NULL, y = "Total Comments in Discord Server")+
+  theme_classic()
+SGLComments
+
+TotalCommentStatusSummary <- SGLCheatSheet %>% 
+  group_by(status) %>% 
+  summarise(status_message_count = sum(message_count))
+TotalCommentStatusSummary <- TotalCommentStatusSummary %>% 
+  ungroup() %>% 
+  mutate(total_messages = sum(status_message_count),
+         percentage_messages = ((status_message_count/total_messages)*100))
+
+totalstatustable <- gt(TotalCommentStatusSummary)
+totalstatustable
+#Now to do comments where it slices to only people with >50 comments
+p_comment_total_slice <- ggplot(data = SGLCheatSheetSlice, aes(reorder(player_name, message_count), y = message_count, fill = status, label = message_count))+
+  geom_col(show.legend = TRUE)+
+  geom_text(aes(label = message_count))+
+  labs(x = NULL, y = NULL) +
+  ggtitle(paste("Total Comments per User"))+
+  coord_flip()+
+  theme_classic()
+p_comment_total_slice
+```
+
+```{r filesaving, echo = FALSE}
+currentDate <- Sys.Date()
+dfFileName <- paste("SGLDataframe",currentDate,".Rdata", sep = "")
+save.image(dfFileName)
+```
+
+
+
+```{r, counts, echo = FALSE}
+#Counts
+SGLRecruitLogMaster$status <- factor(SGLRecruitLogMaster$status)
+StatusCount <- SGLRecruitLogMaster %>% 
+  group_by(status) %>% 
+  distinct(record_id, .keep_all = TRUE) %>% 
+  tally()
+gt(StatusCount)
+
+```
+Discords unmatched with redcap
+
+```{r, NAs, echo = FALSE}
+NACounter <- recent_pull %>% 
+  select(record_id,user,id,status)%>% 
+  filter(is.na(record_id)) %>% 
+  filter(is.na(status)) %>% 
+  distinct(id, .keep_all = TRUE)
+print(NACounter)
+```
+
+
+```{r, patient-data-import-to-redcap, echo = FALSE}
+patient_redcap_import <- datedtblnames %>% 
+  select(record_id,user,id,message_count,date,last_date,last_message_count,recent_comments,time_interval,player_name) %>% 
+  rename(
+    comments_user = user,
+    comments_id = id,
+    comments_message_count = message_count,
+    comments_date = date,
+    comments_last_date = last_date,
+    comments_last_message = last_message_count,
+    comments_recent = recent_comments,
+    comments_timeint = time_interval,
+    comments_player_name = player_name
+  ) %>%
+  filter(record_id != "NA") %>% 
+  mutate(redcap_repeat_instrument = "sgl_comments",
+         sgl_comments_complete = "Complete")
+
+patient_redcap_import <- patient_redcap_import %>%   
+  group_by(record_id) %>% 
+  arrange(comments_date) %>% 
+  mutate(redcap_repeat_instance = seq_along(comments_date)) %>% 
+  as.data.frame()
+patient_redcap_import$comments_date <- as.character(patient_redcap_import$comments_date)
+patient_redcap_import$comments_last_date <- as.character(patient_redcap_import$comments_last_date)
+patient_redcap_import$comments_timeint <- as.character(patient_redcap_import$comments_timeint)
+
+patient_redcap_import$comments_message_count <- as.double(patient_redcap_import$comments_message_count)
+
+
+
+#in future workflow, at this point add a function that checks for duplicates with this patient_redcap_import file and the most recent redcap pull. Then, only upload differences. Will save considerable amount of time uploading 
+
+
+importRecords(rcon,patient_redcap_import)
+```
+
+
+```{r, volunteer-data-import-to-redcap, echo = FALSE}
+vol_and_staff <- c("Staff","Volunteer")
+volunteer_redcap_import <- datedtblnames %>% 
+  select(user,id,message_count,date,last_date,last_message_count,recent_comments,time_interval,player_name,status) %>% 
+  rename(
+    comments_user = user,
+    comments_id = id,
+    comments_message_count = message_count,
+    comments_date = date,
+    comments_last_date = last_date,
+    comments_last_message = last_message_count,
+    comments_recent = recent_comments,
+    comments_timeint = time_interval,
+    v_full_name = player_name,
+  ) %>% 
+  filter(status %in% vol_and_staff) %>% 
+  rename(comments_status = status) %>% 
+  mutate(redcap_repeat_instrument = "sgl_comments",
+         sgl_comments_complete = "Complete")
+
+#Reuploading REDCapData_Volunteers
+vol_record_ids <- REDCapData_Volunteers %>% 
+  select(v_full_name,record_id) %>%
+  filter(v_full_name != "NA")
+volunteer_redcap_import_record_ids <- stringdist_inner_join(volunteer_redcap_import,vol_record_ids, by = "v_full_name", max_dist = 0)
+
+volunteer_redcap_import_record_ids <- volunteer_redcap_import_record_ids %>% 
+  rename(comments_player_name = v_full_name.x) %>% 
+  select(-v_full_name.y)
+
+volunteer_redcap_import_record_ids <- volunteer_redcap_import_record_ids %>%   
+  group_by(record_id) %>% 
+  arrange(comments_date) %>% 
+  mutate(redcap_repeat_instance = seq_along(comments_date)) %>% 
+  as.data.frame()
+volunteer_redcap_import_record_ids$comments_date <- as.character(volunteer_redcap_import_record_ids$comments_date)
+volunteer_redcap_import_record_ids$comments_last_date <- as.character(volunteer_redcap_import_record_ids$comments_last_date)
+volunteer_redcap_import_record_ids$comments_timeint <- as.character(volunteer_redcap_import_record_ids$comments_timeint)
+
+volunteer_redcap_import_record_ids$comments_message_count <- as.double(volunteer_redcap_import_record_ids$comments_message_count)
+
+
+
+#in future workflow, at this point add a function that checks for duplicates with this volunteer_redcap_import_record_ids file and the most recent redcap pull. Then, only upload differences. Will save considerable amount of time uploading 
+
+
+
+importRecords(vcon,volunteer_redcap_import_record_ids)
+
+```
+
+```{r, cheatshee,t, echo = FALSE}
+REDCapData_Patients <- exportRecords(rcon,labels = FALSE)
+
+sgl_status_df <- REDCapData_Patients %>% 
+  select(record_id,p_full_name,age,discord_invite_status,sgl_creed_status,sgl,discord_user,comments_user,redcap_repeat_instrument,redcap_repeat_instance)
+
+# Lists all folks who have been designated as set up in Discord-- this includes ppl with confirmed by staff usernames (reading their name in the welcome message upon entry), or comment history in server. 
+
+all_discord_users_sheet <- sgl_status_df %>% 
+  filter(unclass(discord_invite_status) == 1) %>% 
+  distinct(record_id,p_full_name,age,sgl_creed_status,sgl)
+
+
+# Need to be able to pull the most recent discord user from the comment_user column, and for discord_user in sgl new patient form. This code modified from Census. 
+
+current_discord_info <- sgl_status_df %>% 
+  group_by(record_id) %>% 
+  filter(redcap_repeat_instrument == "sgl_new_patient") %>% 
+  mutate(current_discord_info = last(discord_user,order_by = redcap_repeat_instance)) %>% 
+  fill(current_discord_info) %>% 
+  distinct(record_id, .keep_all = TRUE) %>% 
+  dplyr::select(record_id,current_discord_info)
+
+current_discord_comment <- sgl_status_df %>% 
+  group_by(record_id) %>% 
+  filter(redcap_repeat_instrument == "sgl_comments") %>% 
+  mutate(current_discord_user = last(comments_user,order_by = redcap_repeat_instance)) %>% 
+  fill(current_discord_user) %>% 
+  distinct(record_id, .keep_all = TRUE) %>% 
+  dplyr::select(record_id,current_discord_user)
+
+all_discords_user_info_sgl_new <- left_join(all_discord_users_sheet, current_discord_info, by = "record_id")
+
+all_discords_user_info_sglnew_and_comments <-   left_join(all_discords_user_info_sgl_new, current_discord_comment, by = "record_id")
+
+VolToken <- read_csv("volunteertoken.csv", col_names = FALSE)
+StreetlightVolunteerToken <- as.character(VolToken[1,1])
+vcon <- redcapConnection(redcap_api_url, token = StreetlightVolunteerToken)
+REDCapData_Volunteers <- exportRecords(vcon,labels = FALSE)
+
+vol_discord_info <- REDCapData_Volunteers %>% 
+  group_by(record_id) %>% 
+  fill(v_full_name,status) %>% 
+  filter(redcap_repeat_instrument == "sgl_new_patient") %>% 
+  mutate(current_discord_info = last(discord_userr,order_by = redcap_repeat_instance)) %>% 
+  fill(current_discord_info) %>% 
+  distinct(record_id, .keep_all = TRUE) %>% 
+  dplyr::select(record_id,v_full_name,status,current_discord_info)
+
+
+vol_comments <- REDCapData_Volunteers %>% 
+  group_by(record_id) %>% 
+  filter(redcap_repeat_instrument == "sgl_comments") %>% 
+  mutate(current_discord_user = last(comments_user,order_by = redcap_repeat_instance)) %>% 
+  fill(current_discord_user) %>% 
+  distinct(record_id, .keep_all = TRUE) %>% 
+  dplyr::select(record_id,current_discord_user)
+
+volunteer_discord_list <- full_join(vol_discord_info,vol_comments, by = "record_id") %>% 
+  rename(user_from_redcap = current_discord_info,
+         user_from_comments = current_discord_user) %>% 
+   mutate(commented = case_when(is.na(user_from_comments) ~ "No",
+                               TRUE ~ "Yes"))
+
+patient_discord_info <-  all_discords_user_info_sglnew_and_comments %>% 
+  mutate(status = "Patient") %>% 
+  rename(user_from_redcap = current_discord_info,
+         user_from_comments = current_discord_user) %>% 
+  mutate(commented = case_when(is.na(user_from_comments) ~ "No",
+                               TRUE ~ "Yes"))
+
+
+
+write_csv(patient_discord_info, "patient_cheatsheet.csv", na = "")
+write_csv(volunteer_discord_list, "volunteer_cheatsheet.csv", na = "")
+
+```
+
